@@ -263,36 +263,42 @@ gltf[:meshes] << { primitives: prim_entries, name: "Mesh" }
 gltf[:buffers] = [{ byteLength: bin.string.bytesize }]
 
       # ---- Write GLB ---------------------------------------------------------
-      json_str = JSON.generate(gltf)
-      json_pad = (4 - (json_str.bytesize % 4)) % 4
-      json_str += " " * json_pad
+# ---- Write GLB ---------------------------------------------------------
+json_str = JSON.generate(gltf)
 
-      bin_data = bin.string
-      bin_pad = (4 - (bin_data.bytesize % 4)) % 4
-      bin_data += "\x00" * bin_pad
+# 4-byte alignment for JSON
+json_pad = (4 - (json_str.bytesize % 4)) % 4
+json_str += " " * json_pad
 
-      File.open(glb_path, "wb") do |f|
-        f.write("glTF".b)                          
-        f.write([2].pack("L<"))                    
-        total_len = 12 + 8 + json_str.bytesize + 8 + bin_data.bytesize
-        f.write([total_len].pack("L<"))            
+# Binary buffer + 4-byte alignment
+bin_data = bin.string
+bin_pad  = (4 - (bin_data.bytesize % 4)) % 4
+bin_data += "\x00" * bin_pad
 
-        f.write([json_str.bytesize].pack("L<"))
-        f.write(["JSON".b].pack("A4"))
-        f.write(json_str)
+# IMPORTANT: Set buffers AFTER padding, using the actual BIN chunk size
+gltf[:buffers] = [{ byteLength: bin_data.bytesize }]
 
-        f.write([bin_data.bytesize].pack("L<"))
-        f.write(["BIN".b].pack("A4"))
-        f.write(bin_data)
-      end
+# Re-generate JSON now that buffers has final byteLength
+json_str = JSON.generate(gltf)
+json_pad = (4 - (json_str.bytesize % 4)) % 4
+json_str += " " * json_pad
 
-      model.commit_operation
-      UI.messagebox("Exported:\n#{glb_path}")
-    rescue => e
-      model.abort_operation
-      UI.messagebox("Export failed: #{e.class}: #{e.message}\n#{e.backtrace&.first}")
-    end
+File.open(glb_path, "wb") do |f|
+  f.write("glTF".b)                 # magic
+  f.write([2].pack("L<"))           # version
+  total_len = 12 + 8 + json_str.bytesize + 8 + bin_data.bytesize
+  f.write([total_len].pack("L<"))
 
+  # JSON chunk
+  f.write([json_str.bytesize].pack("L<"))
+  f.write(["JSON".b].pack("A4"))
+  f.write(json_str)
+
+  # BIN chunk
+  f.write([bin_data.bytesize].pack("L<"))
+  f.write(["BIN".b].pack("A4"))     # writes "BIN\0"
+  f.write(bin_data)
+end
     # ---- UI -----------------------------------------------------------------
     UI.add_context_menu_handler { |menu| menu.add_item(PLUGIN_NAME){ self.export } }
     UI.menu("File").add_item(PLUGIN_NAME){ self.export }
