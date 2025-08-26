@@ -139,55 +139,6 @@ each_visible_face_with_tr(ents) do |face, tr_inst|
     prim[:indices].concat([base, base+1, base+2])
   end
 end
-
-      def self.each_face(entities, &block)
-        entities.grep(Sketchup::Face).each { |f| yield f }
-        entities.grep(Sketchup::Group).each { |g| each_face(g.entities, &block) }
-        entities.grep(Sketchup::ComponentInstance).each { |i| each_face(i.definition.entities, &block) }
-      end
-
-      each_face(ents) do |face|
-        mesh = face.mesh(0)
-        next unless mesh
-        su_mat = face.material || face.back_material
-        prim = primitive_for_material(material_map, prims, su_mat)
-        pts = mesh.points
-        tri_count = mesh.count_polygons
-        (1..tri_count).each do |t|
-          idxs = mesh.polygon_at(t)
-          next unless idxs && idxs.length >= 3
-
-          # Grab transformed triangle vertices (already in world_to_gltf space)
-          v = []
-          p3 = []
-          3.times do |k|
-            i = idxs[k].abs
-            p = pts[i - 1]
-            next unless p
-            p4 = Geom::Point3d.new(p.x, p.y, p.z).transform(tr_world)
-            p3 << p4
-            v  << p4.x.to_f << p4.y.to_f << p4.z.to_f
-          end
-          next unless p3.length == 3
-
-          # Flat normal for the triangle
-          a = p3[1] - p3[0]
-          b = p3[2] - p3[0]
-          n = a.cross(b)
-          if n.length == 0.0
-            n = Geom::Vector3d.new(0,0,1)
-          else
-            n = n.normalize
-          end
-
-          # Append positions + normals (3 verts)
-          base = positions.length / 3
-          positions.concat(v)
-          3.times { normals << n.x.to_f << n.y.to_f << n.z.to_f }
-          prim[:indices].concat([base, base+1, base+2])
-        end
-      end
-
       bin = StringIO.new("".b)
       align4 = ->(io){ pad = (4 - (io.string.bytesize % 4)) % 4; io.write("\x00"*pad) if pad > 0 }
 
