@@ -262,18 +262,6 @@ gltf[:meshes] << { primitives: prim_entries, name: "Mesh" }
 # ---- AFTER writing everything, set the final buffer length -------------
 gltf[:buffers] = [{ byteLength: bin.string.bytesize }]
 
-used = 0
-gltf[:bufferViews].each_with_index do |bv, i|
-  raise "bufferView[#{i}] not buffer 0" unless bv[:buffer] == 0
-  end_off = bv[:byteOffset] + bv[:byteLength]
-  used = [used, end_off].max
-end
-
-raise "accessors empty" if gltf[:accessors].empty?
-raise "meshes empty"    if gltf[:meshes].empty?
-
-# After padding BIN
-raise "BIN smaller than used views (#{bin_data.bytesize} < #{used})" if bin_data.bytesize < used
 
   
       # ---- Write GLB ---------------------------------------------------------
@@ -312,6 +300,19 @@ File.open(glb_path, "wb") do |f|
   f.write(["BIN".b].pack("A4"))     # writes "BIN\0"
   f.write(bin_data)
 end
+
+used = 0
+gltf[:bufferViews].each_with_index do |bv, i|
+  raise "bufferView[#{i}] not buffer 0" unless bv[:buffer] == 0
+  end_off = bv[:byteOffset] + bv[:byteLength]
+  used = [used, end_off].max
+end
+
+raise "accessors empty" if gltf[:accessors].empty?
+raise "meshes empty"    if gltf[:meshes].empty?
+
+# After padding BIN
+raise "BIN smaller than used views (#{bin_data.bytesize} < #{used})" if bin_data.bytesize < used
 
 
       model.commit_operation
