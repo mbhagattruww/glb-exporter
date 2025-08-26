@@ -244,6 +244,7 @@ acc_nrm = gltf[:accessors].length - 1
 images   = []
 textures = []
 
+mat_keys_sorted = material_map.keys.sort_by { |k| material_map[k] }
 mat_keys_sorted.each do |key|
   su_mat = key == "_DEFAULT_" ? nil : Sketchup.active_model.materials[key]
 
