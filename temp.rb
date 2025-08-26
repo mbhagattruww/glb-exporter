@@ -44,20 +44,24 @@ end
       end
     end
 
-def self.visible_entities(entities, tr = Geom::Transformation.new)
-  ents = []
+# Walk visible faces and carry the accumulated transform (groups/components)
+def self.each_visible_face_with_tr(entities, tr_accum = Geom::Transformation.new, &block)
   entities.each do |e|
+    # Skip hidden or tag/layer turned off
     next if e.hidden?
-    next if e.layer && !e.layer.visible?
+    if e.respond_to?(:layer) && e.layer && !e.layer.visible?
+      next
+    end
 
     case e
     when Sketchup::Face
-      ents << e
-    when Sketchup::Group, Sketchup::ComponentInstance
-      ents.concat(visible_entities(e.definition.entities, tr * e.transformation))
+      yield e, tr_accum
+    when Sketchup::Group
+      each_visible_face_with_tr(e.entities, tr_accum * e.transformation, &block)
+    when Sketchup::ComponentInstance
+      each_visible_face_with_tr(e.definition.entities, tr_accum * e.transformation, &block)
     end
   end
-  ents
 end
     
     # ---- Core Export ---------------------------------------------------------
@@ -70,7 +74,9 @@ end
       bin_filename = "#{base}.bin"
       bin_path     = File.join(dir, bin_filename)
       model = Sketchup.active_model
-      ents  = visible_entities(model.entities)
+      sel   = model.selection
+      ents  = sel.empty? ? model.entities : sel
+
       triangles = []
       positions = []
       normals   = []     # NEW
@@ -88,8 +94,51 @@ end
         prims.find { |p| p[:mat_idx] == idx }
       end
 
-      tr_world = self.world_to_gltf
-      model.start_operation("Export glTF (Minimal .glb)", true)
+tr_world = self.world_to_gltf
+model.start_operation("Export glTF (Minimal .gltf + .bin)", true)
+
+each_visible_face_with_tr(ents) do |face, tr_inst|
+  mesh = face.mesh(0)
+  next unless mesh
+
+  su_mat = face.material || face.back_material
+  prim = primitive_for_material(material_map, prims, su_mat)
+  pts = mesh.points
+  tri_count = mesh.count_polygons
+
+  (1..tri_count).each do |t|
+    idxs = mesh.polygon_at(t)
+    next unless idxs && idxs.length >= 3
+
+    v  = []
+    p3 = []
+    3.times do |k|
+      i = idxs[k].abs
+      p = pts[i - 1]
+      next unless p
+
+      # 1) local(definition) -> model: apply instance/group transform chain
+      p_model = Geom::Point3d.new(p.x, p.y, p.z).transform(tr_inst)
+      # 2) model -> glTF: scale inches->meters and -90° X
+      p_gl    = p_model.transform(tr_world)
+
+      p3 << p_gl
+      v  << p_gl.x.to_f << p_gl.y.to_f << p_gl.z.to_f
+    end
+    next unless p3.length == 3
+
+    # Flat triangle normal in glTF space
+    a = p3[1] - p3[0]
+    b = p3[2] - p3[0]
+    n = a.cross(b)
+    n = (n.length == 0.0) ? Geom::Vector3d.new(0,0,1) : n.normalize
+
+    base = positions.length / 3
+    positions.concat(v)
+    3.times { normals << n.x.to_f << n.y.to_f << n.z.to_f }
+    prim[:indices].concat([base, base+1, base+2])
+  end
+end
 
       def self.each_face(entities, &block)
         entities.grep(Sketchup::Face).each { |f| yield f }
@@ -303,4 +352,3 @@ UI.messagebox("Exported:\n#{gltf_path}\n#{bin_path}")
     @menu_installed = true
   end
 end
-
