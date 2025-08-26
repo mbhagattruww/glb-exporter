@@ -44,6 +44,22 @@ end
       end
     end
 
+def self.visible_entities(entities, tr = Geom::Transformation.new)
+  ents = []
+  entities.each do |e|
+    next if e.hidden?
+    next if e.layer && !e.layer.visible?
+
+    case e
+    when Sketchup::Face
+      ents << e
+    when Sketchup::Group, Sketchup::ComponentInstance
+      ents.concat(visible_entities(e.definition.entities, tr * e.transformation))
+    end
+  end
+  ents
+end
+    
     # ---- Core Export ---------------------------------------------------------
     def self.export
       path = UI.savepanel("Export glTF (Minimal .gltf + .bin)", Dir.pwd, "model.gltf")
@@ -54,9 +70,7 @@ end
       bin_filename = "#{base}.bin"
       bin_path     = File.join(dir, bin_filename)
       model = Sketchup.active_model
-      sel   = model.selection
-      ents  = sel.empty? ? model.entities : sel
-
+      ents  = visible_entities(model.entities)
       triangles = []
       positions = []
       normals   = []     # NEW
