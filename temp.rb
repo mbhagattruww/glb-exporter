@@ -72,6 +72,7 @@ module Truww
 
       triangles = []
       positions = []
+      normals   = []     # NEW
       material_map = {}
       prims = []
 
@@ -105,16 +106,36 @@ module Truww
         (1..tri_count).each do |t|
           idxs = mesh.polygon_at(t)
           next unless idxs && idxs.length >= 3
+
+          # Grab transformed triangle vertices (already in world_to_gltf space)
           v = []
+          p3 = []
           3.times do |k|
             i = idxs[k].abs
-            p = pts[i - 1]   # FIX: 1-based -> 0-based
+            p = pts[i - 1]
             next unless p
             p4 = Geom::Point3d.new(p.x, p.y, p.z).transform(tr_world)
-            v << p4.x.to_f << p4.y.to_f << p4.z.to_f
+            p3 << p4
+            v  << p4.x.to_f << p4.y.to_f << p4.z.to_f
           end
+          next unless p3.length == 3
+
+          # Flat normal for the triangle
+          a = p3[1] - p3[0]
+          b = p3[2] - p3[0]
+          n = a.cross(b)
+          if n.length == 0.0
+            n = Geom::Vector3d.new(0,0,1)
+          else
+            n = n.normalize
+          end
+
+          # Append positions + normals (3 verts)
           base = positions.length / 3
           positions.concat(v)
+          3.times { normals << n.x.to_f << n.y.to_f << n.z.to_f }
+
+          # Indices for this triangle
           prim[:indices].concat([base, base+1, base+2])
         end
       end
@@ -161,26 +182,51 @@ module Truww
       #   byteLength: bin.string.bytesize,
       #   target: 34962
       # }
-      # --- Build bufferViews / accessors correctly ------------------------------
+      # ---- Build bufferViews / accessors in correct order -------------------
       gltf[:bufferViews] = []
-      gltf[:accessors] = []
+      gltf[:accessors]   = []
 
-      # Position bufferView: use the actual offset and length where positions were written
+      # Positions
+      align4.call(bin)
+      pos_offset = bin.string.bytesize
+      bin.write(pack_f32(positions))
+      pos_length = bin.string.bytesize - pos_offset
+
       gltf[:bufferViews] << {
         buffer: 0,
-        byteOffset: pos_buffer_view_offset,
-        byteLength: pos_byte_length,
+        byteOffset: pos_offset,
+        byteLength: pos_length,
         target: 34962
       }
       gltf[:accessors] << {
-        bufferView: 0,
-        componentType: 5126,
+        bufferView: gltf[:bufferViews].length - 1,
+        componentType: 5126, # FLOAT
         count: positions.length / 3,
         type: "VEC3",
         min: pos_min,
         max: pos_max
       }
-      acc_pos_index = 0
+      acc_pos_index = gltf[:accessors].length - 1
+
+      # Normals (flat per-triangle; one per vertex)
+      align4.call(bin)
+      nrm_offset = bin.string.bytesize
+      bin.write(pack_f32(normals))
+      nrm_length = bin.string.bytesize - nrm_offset
+
+      gltf[:bufferViews] << {
+        buffer: 0,
+        byteOffset: nrm_offset,
+        byteLength: nrm_length,
+        target: 34962
+      }
+      gltf[:accessors] << {
+        bufferView: gltf[:bufferViews].length - 1,
+        componentType: 5126, # FLOAT
+        count: normals.length / 3,
+        type: "VEC3"
+      }
+      acc_nrm_index = gltf[:accessors].length - 1
 
       # Materials (unchanged)
       mat_keys_sorted = material_map.keys.sort_by { |k| material_map[k] }
@@ -196,29 +242,33 @@ module Truww
         gltf[:materials] << pbr
       end
 
-      # For each primitive: create a bufferView for its indices and an accessor
+      # Indices: write and wire each primitive
       prim_entries = []
-      prims.each_with_index do |p, i|
-        pb = prim_buffers[i]
-        bv_idx = gltf[:bufferViews].length
+      prims.each do |p|
+        align4.call(bin)
+        off = bin.string.bytesize
+        bin.write(pack_u32(p[:indices]))
+        len = bin.string.bytesize - off
+
         gltf[:bufferViews] << {
           buffer: 0,
-          byteOffset: pb[:byteOffset],
-          byteLength: pb[:byteLength],
-          target: 34963
+          byteOffset: off,
+          byteLength: len,
+          target: 34963 # ELEMENT_ARRAY_BUFFER
         }
-        acc_idx = gltf[:accessors].length
         gltf[:accessors] << {
-          bufferView: bv_idx,
-          componentType: 5125,    # UNSIGNED_INT
-          count: pb[:count],
+          bufferView: gltf[:bufferViews].length - 1,
+          componentType: 5125, # UNSIGNED_INT
+          count: p[:indices].length,
           type: "SCALAR"
         }
+        acc_idx = gltf[:accessors].length - 1
+
         prim_entries << {
-          attributes: { "POSITION" => acc_pos_index },
+          attributes: { "POSITION" => acc_pos_index, "NORMAL" => acc_nrm_index },
           indices: acc_idx,
           material: p[:mat_idx],
-          mode: 4
+          mode: 4 # TRIANGLES
         }
       end
 
