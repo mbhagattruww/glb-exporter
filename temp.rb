@@ -100,7 +100,7 @@ model.start_operation("Export glTF (Minimal .gltf + .bin)", true)
 uvs = []
 
 each_visible_face_with_tr(ents) do |face, tr_inst|
-  mesh = face.mesh(0)
+  mesh = face.mesh 7  # include UVs
   next unless mesh
 
   su_mat = face.material || face.back_material
@@ -120,17 +120,18 @@ each_visible_face_with_tr(ents) do |face, tr_inst|
       p = pts[i - 1]
       next unless p
 
-      # Transform to world → glTF
       p_model = p.transform(tr_inst)
       p_gl    = p_model.transform(tr_world)
-
-      # Position
+    
       p3 << p_gl
       v  << p_gl.x.to_f << p_gl.y.to_f << p_gl.z.to_f
+    
+      # UV from mesh
+      uvq = mesh.uv_at(i, true)   # front side
+      u = uvq.x / uvq.z
+      vtex = uvq.y / uvq.z
+      uvs << u.to_f << vtex.to_f
 
-      # UV from face
-      uvq = face.uv_at(p, true)  # true = front side
-      uvtri << [uvq.x.to_f, uvq.y.to_f]
     end
     next unless p3.length == 3
 
