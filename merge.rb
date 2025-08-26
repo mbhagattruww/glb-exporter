@@ -49,288 +49,288 @@
 		  end
 		end
 
-		def self.export( gltf_path, bin_path, ents )
-		  triangles = []
-		  positions = []
-		  normals = []     # NEW
-		  material_map = {}
-		  prims = []
+def self.export(gltf_path, bin_path, ents)
+  begin
+    # Use only the filename (with extension) for buffers[0].uri (glTF needs relative URI)
+    bin_filename = File.basename(bin_path)
 
-		  bin_filename = File.basename(bin_path, ".*")
+    # ---------- helpers ----------
+    def self.entity_label(e)
+      case e
+      when Sketchup::Group
+        e.name.to_s.strip.empty? ? "Group_#{e.entityID}" : e.name
+      when Sketchup::ComponentInstance
+        nm = e.name.to_s.strip
+        nm = e.definition&.name.to_s if nm.empty?
+        nm = "Component_#{e.entityID}" if nm.nil? || nm.strip.empty?
+        nm
+      else
+        "UntaggedGeometry"
+      end
+    end
 
-		  def self.primitive_for_material(material_map, prims, su_material)
-			key = su_material ? su_material.display_name : "_DEFAULT_"
-			unless material_map.key?(key)
-			  mat_index = material_map.length
-			  material_map[key] = mat_index
-			  prims << { mat_idx: mat_index, indices: [] }
-			end
-			idx = material_map[key]
-			prims.find { |p| p[:mat_idx] == idx }
-		  end
+    def self.primitive_for_material(material_map, prims, su_material)
+      key = su_material ? su_material.display_name : "_DEFAULT_"
+      unless material_map.key?(key)
+        mat_index = material_map.length
+        material_map[key] = mat_index
+        prims << { mat_idx: mat_index, indices: [] }
+      end
+      idx = material_map[key]
+      prims.find { |p| p[:mat_idx] == idx }
+    end
 
-		  tr_world = self.world_to_gltf
+    # ---------- collect faces by top-level object ----------
+    TopObject = Struct.new(:name, :faces) # faces: [[face, tr_accum]]
+    objects = {}                         # key: carrier entity or :__ROOT__ => TopObject
+    material_map = {}
 
-		  uvs = []
+    tr_world = self.world_to_gltf
 
-		  each_visible_face_with_tr(ents) do |face, tr_inst|
-			mesh = face.mesh 7  # include UVs
-			next unless mesh
+    # Faces directly under root selection/model
+    ents.each do |e|
+      next if e.hidden?
+      if e.respond_to?(:layer) && e.layer && !e.layer.visible?
+        next
+      end
 
-			su_mat = face.material || face.back_material
-			prim = primitive_for_material(material_map, prims, su_mat)
-			pts = mesh.points
-			tri_count = mesh.count_polygons
+      case e
+      when Sketchup::Face
+        key = :__ROOT__
+        objects[key] ||= TopObject.new("UntaggedGeometry", [])
+        objects[key].faces << [e, Geom::Transformation.new]
+      when Sketchup::Group, Sketchup::ComponentInstance
+        key = e
+        objects[key] ||= TopObject.new(self.entity_label(e), [])
+        # collect faces beneath this carrier with accumulated transform
+        self.each_visible_face_with_tr(
+          e.respond_to?(:entities) ? e.entities : e.definition.entities,
+          e.transformation
+        ) { |f, tr_accum| objects[key].faces << [f, tr_accum] }
+      else
+        # descend if it has entities (rare at top level)
+        if e.respond_to?(:entities)
+          self.each_visible_face_with_tr(e.entities) { |f, tr_accum|
+            key = :__ROOT__
+            objects[key] ||= TopObject.new("UntaggedGeometry", [])
+            objects[key].faces << [f, tr_accum]
+          }
+        end
+      end
+    end
 
-			(1..tri_count).each do |t|
-			  idxs = mesh.polygon_at(t)
-			  next unless idxs && idxs.length >= 3
+    # ---------- init glTF containers ----------
+    bin = StringIO.new("".b)
+    align4 = ->(io) { pad = (4 - (io.string.bytesize % 4)) % 4; io.write("\x00" * pad) if pad > 0 }
 
-			  v = []
-			  p3 = []
-			  uvtri = []
-			  3.times do |k|
-				i = idxs[k].abs
-				p = pts[i - 1]
-				next unless p
+    gltf = {
+      asset: { version: "2.0", generator: "Truww Minimal SU→glTF (Named)" },
+      scenes: [ { nodes: [] } ],
+      scene: 0,
+      nodes: [],
+      buffers: [],
+      bufferViews: [],
+      accessors: [],
+      materials: [],
+      meshes: []
+    }
 
-				p_model = p.transform(tr_inst)
-				p_gl = p_model.transform(tr_world)
+    images   = []
+    textures = []
 
-				p3 << p_gl
-				v << p_gl.x.to_f << p_gl.y.to_f << p_gl.z.to_f
+    # ---------- build per-object geometry and write to BIN ----------
+    objects.each_value do |obj|
+      positions = []
+      normals   = []
+      uvs       = []
+      # mat_idx => { indices: [] }
+      prims_by_mat = Hash.new { |h, k| h[k] = { indices: [] } }
 
-				# UV from mesh
-				uvq = mesh.uv_at(i, true)   # front side
-				u = uvq.x / uvq.z
-				vtex = uvq.y / uvq.z
-				uvs << u.to_f << vtex.to_f
-			  end
-			  next unless p3.length == 3
+      obj.faces.each do |face, tr_inst|
+        mesh = face.mesh 7 # include UVs
+        next unless mesh
 
-			  # Normal
-			  a = p3[1] - p3[0]
-			  b = p3[2] - p3[0]
-			  n = a.cross(b)
-			  n = (n.length == 0.0) ? Geom::Vector3d.new(0, 0, 1) : n.normalize
+        # choose face material (front/back)
+        su_mat = face.material || face.back_material
+        mat_key = su_mat ? su_mat.display_name : "_DEFAULT_"
+        # ensure material index exists
+        material_map[mat_key] ||= material_map.length
+        mat_idx = material_map[mat_key]
 
-			  base = positions.length / 3
-			  positions.concat(v)
-			  3.times { normals << n.x.to_f << n.y.to_f << n.z.to_f }
-			  uvtri.each { |u, vv| uvs << u << vv }  # push 2D UVs
-			  prim[:indices].concat([base, base + 1, base + 2])
-			end
-		  end
+        pts = mesh.points
+        tri_count = mesh.count_polygons
 
-		  bin = StringIO.new("".b)
-		  align4 = ->(io) { pad = (4 - (io.string.bytesize % 4)) % 4; io.write("\x00" * pad) if pad > 0 }
+        (1..tri_count).each do |t|
+          idxs = mesh.polygon_at(t)
+          next unless idxs && idxs.length >= 3
 
-		  minmax = ->(arr) {
-			xs, ys, zs = [], [], []
-			arr.each_slice(3) { |x, y, z| xs << x; ys << y; zs << z }
-			[[xs.min || 0, ys.min || 0, zs.min || 0], [xs.max || 0, ys.max || 0, zs.max || 0]]
-		  }
-		  pos_min, pos_max = minmax.call(positions)
+          p3 = []
+          v3 = []
+          3.times do |k|
+            i = idxs[k].abs
+            p = pts[i - 1]
+            next unless p
 
-		  # ---- Build bufferViews / accessors in correct order -------------------
-		  # Create the root glTF object (must exist before you set bufferViews/accessors)
-		  gltf = {
-			asset: { version: "2.0", generator: "Truww Minimal SU→glTF" },
-			scenes: [{ nodes: [0] }],
-			scene: 0,
-			nodes: [{ mesh: 0, name: "Root" }],
-			buffers: [],        # will set after writing BIN
-			bufferViews: [],    # we will fill now
-			accessors: [],      # we will fill now
-			materials: [],
-			meshes: []
-		  }
+            p_model = p.transform(tr_inst)
+            p_gl    = p_model.transform(tr_world)
 
-		  gltf[:bufferViews] = []
-		  gltf[:accessors] = []
-		  gltf[:meshes] = []
+            p3 << p_gl
+            v3 << p_gl.x.to_f << p_gl.y.to_f << p_gl.z.to_f
 
-		  # Positions
-		  align4.call(bin)
-		  pos_offset = bin.string.bytesize
-		  bin.write(pack_f32(positions))
-		  pos_length = bin.string.bytesize - pos_offset
+            # UVs
+            uvq  = mesh.uv_at(i, true) # front side
+            u    = uvq.x / uvq.z
+            vtex = uvq.y / uvq.z
+            uvs << u.to_f << vtex.to_f
+          end
+          next unless p3.length == 3
 
-		  gltf[:bufferViews] << {
-			buffer: 0,
-			byteOffset: pos_offset,
-			byteLength: pos_length,
-			target: 34962 # ARRAY_BUFFER
-		  }
-		  gltf[:accessors] << {
-			bufferView: gltf[:bufferViews].length - 1,
-			componentType: 5126, # FLOAT
-			count: positions.length / 3,
-			type: "VEC3",
-			min: pos_min,
-			max: pos_max
-		  }
-		  acc_pos = gltf[:accessors].length - 1
+          # flat normal for the triangle
+          a = p3[1] - p3[0]
+          b = p3[2] - p3[0]
+          n = a.cross(b)
+          n = (n.length == 0.0) ? Geom::Vector3d.new(0, 0, 1) : n.normalize
 
-		  # Normals (flat per-triangle; already built to match positions count)
-		  align4.call(bin)
-		  nrm_offset = bin.string.bytesize
-		  bin.write(pack_f32(normals))
-		  nrm_length = bin.string.bytesize - nrm_offset
+          base = positions.length / 3
+          positions.concat(v3)
+          3.times { normals << n.x.to_f << n.y.to_f << n.z.to_f }
 
-		  # TEXCOORD_0
-		  align4.call(bin)
-		  uv_off = bin.string.bytesize
-		  bin.write(pack_f32(uvs))
-		  uv_len = bin.string.bytesize - uv_off
+          prims_by_mat[mat_idx][:indices].concat([base, base + 1, base + 2])
+        end
+      end
 
-		  gltf[:bufferViews] << {
-			buffer: 0,
-			byteOffset: uv_off,
-			byteLength: uv_len,
-			target: 34962
-		  }
-		  gltf[:accessors] << {
-			bufferView: gltf[:bufferViews].length - 1,
-			componentType: 5126, # FLOAT
-			count: uvs.length / 2,
-			type: "VEC2"
-		  }
-		  acc_uv = gltf[:accessors].length - 1
+      # Skip empty objects
+      next if positions.empty?
 
-		  gltf[:bufferViews] << {
-			buffer: 0,
-			byteOffset: nrm_offset,
-			byteLength: nrm_length,
-			target: 34962 # ARRAY_BUFFER
-		  }
-		  gltf[:accessors] << {
-			bufferView: gltf[:bufferViews].length - 1,
-			componentType: 5126, # FLOAT
-			count: normals.length / 3,
-			type: "VEC3"
-		  }
-		  acc_nrm = gltf[:accessors].length - 1
+      # min/max
+      xs, ys, zs = [], [], []
+      positions.each_slice(3) { |x, y, z| xs << x; ys << y; zs << z }
+      pos_min = [xs.min || 0, ys.min || 0, zs.min || 0]
+      pos_max = [xs.max || 0, ys.max || 0, zs.max || 0]
 
-		  images = []
-		  textures = []
+      # Positions
+      align4.call(bin)
+      pos_off = bin.string.bytesize
+      bin.write(self.pack_f32(positions))
+      pos_len = bin.string.bytesize - pos_off
+      bv_pos  = gltf[:bufferViews].length
+      gltf[:bufferViews] << { buffer: 0, byteOffset: pos_off, byteLength: pos_len, target: 34962 }
+      acc_pos = gltf[:accessors].length
+      gltf[:accessors] << { bufferView: bv_pos, componentType: 5126, count: positions.length / 3, type: "VEC3", min: pos_min, max: pos_max }
 
-		  mat_keys_sorted = material_map.keys.sort_by { |k| material_map[k] }
-		  mat_keys_sorted.each do |key|
-			su_mat = key == "_DEFAULT_" ? nil : Sketchup.active_model.materials[key]
+      # Normals
+      align4.call(bin)
+      nrm_off = bin.string.bytesize
+      bin.write(self.pack_f32(normals))
+      nrm_len = bin.string.bytesize - nrm_off
+      bv_nrm  = gltf[:bufferViews].length
+      gltf[:bufferViews] << { buffer: 0, byteOffset: nrm_off, byteLength: nrm_len, target: 34962 }
+      acc_nrm = gltf[:accessors].length
+      gltf[:accessors] << { bufferView: bv_nrm, componentType: 5126, count: normals.length / 3, type: "VEC3" }
 
-			if su_mat && su_mat.texture
-			  tex = su_mat.texture
-			  tmp_path = File.join(Dir.tmpdir, "tex.png")
-			  tex.write(tmp_path)
-			  img_data = File.binread(tmp_path)
+      # UVs
+      align4.call(bin)
+      uv_off = bin.string.bytesize
+      bin.write(self.pack_f32(uvs))
+      uv_len = bin.string.bytesize - uv_off
+      bv_uv  = gltf[:bufferViews].length
+      gltf[:bufferViews] << { buffer: 0, byteOffset: uv_off, byteLength: uv_len, target: 34962 }
+      acc_uv = gltf[:accessors].length
+      gltf[:accessors] << { bufferView: bv_uv, componentType: 5126, count: uvs.length / 2, type: "VEC2" }
 
-			  # Align to 4 bytes
-			  align4.call(bin)
-			  img_off = bin.string.bytesize
-			  bin.write(img_data)
-			  img_len = bin.string.bytesize - img_off
+      # Indices per material => primitives
+      primitives = []
+      prims_by_mat.each do |mat_idx, prim|
+        next if prim[:indices].empty?
 
-			  bv_idx = gltf[:bufferViews].length
-			  gltf[:bufferViews] << {
-				buffer: 0,
-				byteOffset: img_off,
-				byteLength: img_len
-			  }
+        align4.call(bin)
+        idx_off = bin.string.bytesize
+        bin.write(self.pack_u32(prim[:indices]))
+        idx_len = bin.string.bytesize - idx_off
 
-			  img_index = images.length
-			  images << {
-				bufferView: bv_idx,
-				mimeType: "image/png"
-			  }
-			  textures << { source: img_index }
+        bv_idx  = gltf[:bufferViews].length
+        gltf[:bufferViews] << { buffer: 0, byteOffset: idx_off, byteLength: idx_len, target: 34963 }
+        acc_idx = gltf[:accessors].length
+        gltf[:accessors] << { bufferView: bv_idx, componentType: 5125, count: prim[:indices].length, type: "SCALAR" }
 
-			  pbr = {
-				pbrMetallicRoughness: {
-				  baseColorTexture: { index: textures.length - 1 },
-				  metallicFactor: 0.0, roughnessFactor: 0.5
-				},
-				name: su_mat.display_name
-			  }
-			  gltf[:materials] << pbr
-			else
-			  # Fallback flat color
-			  pbr = {
-				pbrMetallicRoughness: {
-				  baseColorFactor: self.color_to_basecolorfactor(su_mat),
-				  metallicFactor: 0.0, roughnessFactor: 0.5
-				},
-				name: (su_mat ? su_mat.display_name : "Default")
-			  }
-			  gltf[:materials] << pbr
-			end
-		  end
+        primitives << {
+          attributes: { "POSITION" => acc_pos, "NORMAL" => acc_nrm, "TEXCOORD_0" => acc_uv },
+          indices: acc_idx,
+          material: mat_idx,
+          mode: 4
+        }
+      end
 
-		  gltf[:images] = images unless images.empty?
-		  gltf[:textures] = textures unless textures.empty?
+      # Mesh + Node per object (this keeps names!)
+      mesh_index = gltf[:meshes].length
+      gltf[:meshes] << { name: obj.name, primitives: primitives }
+      node_index = gltf[:nodes].length
+      gltf[:nodes]  << { name: obj.name, mesh: mesh_index }
+      gltf[:scenes][0][:nodes] << node_index
+    end
 
-		  # Indices per primitive — write and wire
-		  prim_entries = []
-		  prims.each do |p|
-			align4.call(bin)
-			idx_off = bin.string.bytesize
-			bin.write(pack_u32(p[:indices]))
-			idx_len = bin.string.bytesize - idx_off
+    # ---------- Materials (shared; textures embedded in BIN) ----------
+    mat_keys_sorted = material_map.keys.sort_by { |k| material_map[k] }
+    mat_keys_sorted.each do |key|
+      su_mat = key == "_DEFAULT_" ? nil : Sketchup.active_model.materials[key]
+      if su_mat && su_mat.texture
+        tex = su_mat.texture
+        tmp_path = File.join(Dir.tmpdir, "tex.png")
+        tex.write(tmp_path)
+        img_data = File.binread(tmp_path)
 
-			gltf[:bufferViews] << {
-			  buffer: 0,
-			  byteOffset: idx_off,
-			  byteLength: idx_len,
-			  target: 34963 # ELEMENT_ARRAY_BUFFER
-			}
-			gltf[:accessors] << {
-			  bufferView: gltf[:bufferViews].length - 1,
-			  componentType: 5125, # UNSIGNED_INT
-			  count: p[:indices].length,
-			  type: "SCALAR"
-			}
-			acc_idx = gltf[:accessors].length - 1
+        align4.call(bin)
+        img_off = bin.string.bytesize
+        bin.write(img_data)
+        img_len = bin.string.bytesize - img_off
 
-			prim_entries << {
-			  attributes: { "POSITION" => acc_pos, "NORMAL" => acc_nrm, "TEXCOORD_0" => acc_uv },
-			  indices: acc_idx,
-			  material: p[:mat_idx],
-			  mode: 4 # TRIANGLES
-			}
-		  end
+        bv_tex = gltf[:bufferViews].length
+        gltf[:bufferViews] << { buffer: 0, byteOffset: img_off, byteLength: img_len }
 
-		  gltf[:meshes] << { primitives: prim_entries, name: "Mesh" }
+        img_index = images.length
+        images   << { bufferView: bv_tex, mimeType: "image/png" }
+        textures << { source: img_index }
 
-		  # ---- AFTER writing everything, set the final buffer length -------------
-		  gltf[:buffers] = [{ byteLength: bin.string.bytesize }]
+        gltf[:materials] << {
+          name: su_mat.display_name,
+          pbrMetallicRoughness: {
+            baseColorTexture: { index: textures.length - 1 },
+            metallicFactor: 0.0, roughnessFactor: 0.5
+          }
+        }
+      else
+        gltf[:materials] << {
+          name: (su_mat ? su_mat.display_name : "Default"),
+          pbrMetallicRoughness: {
+            baseColorFactor: self.color_to_basecolorfactor(su_mat),
+            metallicFactor: 0.0, roughnessFactor: 0.5
+          }
+        }
+      end
+    end
+    gltf[:images]   = images unless images.empty?
+    gltf[:textures] = textures unless textures.empty?
 
-		  # ---- Finalize external BIN + write .bin/.gltf -------------------------
-		  # 4-byte align the BIN so all bufferView byteOffsets remain valid
-		  bin_data = bin.string
-		  bin_pad = (4 - (bin_data.bytesize % 4)) % 4
-		  bin_data += "\x00" * bin_pad if bin_pad > 0
+    # ---------- finalize buffers ----------
+    bin_data = bin.string
+    pad = (4 - (bin_data.bytesize % 4)) % 4
+    bin_data += "\x00" * pad if pad > 0
 
-		  # Point buffers[0] to external .bin (must be an array with 1 entry)
-		  gltf[:buffers] = [{
-			byteLength: bin_data.bytesize,
-			uri: bin_filename
-		  }]
+    gltf[:buffers] = [{ byteLength: bin_data.bytesize, uri: bin_filename }]
 
-		  # Optional quick sanity check: ensure no bufferView exceeds BIN size
-		  max_used = 0
-		  gltf[:bufferViews].each_with_index do |bv, i|
-			raise "bufferView[#{i}] must reference buffer 0" unless bv[:buffer] == 0
-			end_off = (bv[:byteOffset] || 0) + (bv[:byteLength] || 0)
-			max_used = [max_used, end_off].max
-		  end
-		  raise "BIN smaller than used bufferViews" if bin_data.bytesize < max_used
+    # sanity: bufferViews must reference buffer 0 and fit
+    max_used = 0
+    gltf[:bufferViews].each_with_index do |bv, i|
+      raise "bufferView[#{i}] must reference buffer 0" unless bv[:buffer] == 0
+      end_off = (bv[:byteOffset] || 0) + (bv[:byteLength] || 0)
+      max_used = [max_used, end_off].max
+    end
+    raise "BIN smaller than used bufferViews" if bin_data.bytesize < max_used
 
-		  # Write the .bin
-		  File.binwrite(bin_path, bin_data)
-
-		  # Write the .gltf (pretty or compact; pretty helps debugging)
-		  json_str = JSON.pretty_generate(gltf)
-		  File.write(gltf_path, json_str)
-		rescue => e
-		  UI.messagebox("Export failed: #{e.class}: #{e.message}\n#{e.backtrace&.first}")
-		end
+    # ---------- write files ----------
+    File.binwrite(bin_path, bin_data)
+    File.write(gltf_path, JSON.pretty_generate(gltf))
+  rescue => e
+    UI.messagebox("Export failed: #{e.class}: #{e.message}\n#{e.backtrace&.first}")
+  end
+end
