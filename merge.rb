@@ -30,24 +30,25 @@
 		end
 
 		# Walk visible faces and carry the accumulated transform (groups/components)
-		def self.each_visible_face_with_tr(entities, tr_accum = Geom::Transformation.new, &block)
-		  entities.each do |e|
-			# Skip hidden or tag/layer turned off
-			next if e.hidden?
-			if e.respond_to?(:layer) && e.layer && !e.layer.visible?
-			  next
-			end
+def self.each_visible_face_with_tr(entities, tr_accum = Geom::Transformation.new, mat_override = nil, &block)
+  entities.each do |e|
+    next if e.hidden?
+    if e.respond_to?(:layer) && e.layer && !e.layer.visible?
+      next
+    end
 
-			case e
-			when Sketchup::Face
-			  yield e, tr_accum
-			when Sketchup::Group
-			  each_visible_face_with_tr(e.entities, tr_accum * e.transformation, &block)
-			when Sketchup::ComponentInstance
-			  each_visible_face_with_tr(e.definition.entities, tr_accum * e.transformation, &block)
-			end
-		  end
-		end
+    case e
+    when Sketchup::Face
+      yield e, tr_accum, mat_override
+    when Sketchup::Group
+      child_override = e.material || mat_override
+      each_visible_face_with_tr(e.entities, tr_accum * e.transformation, child_override, &block)
+    when Sketchup::ComponentInstance
+      child_override = e.material || mat_override
+      each_visible_face_with_tr(e.definition.entities, tr_accum * e.transformation, child_override, &block)
+    end
+  end
+end
 
 def self.export(gltf_path, bin_path, ents)
   begin
@@ -109,54 +110,61 @@ def self.export(gltf_path, bin_path, ents)
       normals   = []
       uvs       = []
       prims_by_mat = Hash.new { |h, k| h[k] = { indices: [] } }
-
-      faces.each do |face, tr_accum|
-        next unless face && self.visible?(face)
-        mesh = face.mesh 7 # include UVs
-        next unless mesh
-
-        su_mat = face.material || face.back_material
-        mat_idx = get_mat_idx.call(su_mat)
-
-        pts = mesh.points
-        tri_count = mesh.count_polygons
-
-        (1..tri_count).each do |t|
-          idxs = mesh.polygon_at(t)
-          next unless idxs && idxs.length >= 3
-
-          p3 = []
-          v3 = []
-          3.times do |k|
-            i = idxs[k].abs
-            p = pts[i - 1]
-            next unless p
-
-            p_model = p.transform(tr_accum)
-            p_gl    = p_model.transform(tr_world) # bake to glTF/world
-
-            p3 << p_gl
-            v3 << p_gl.x.to_f << p_gl.y.to_f << p_gl.z.to_f
-
-            uvq  = mesh.uv_at(i, true)
-            u    = uvq.x / uvq.z
-            vv   = uvq.y / uvq.z
-            uvs << u.to_f << vv.to_f
-          end
-          next unless p3.length == 3
-
-          a = p3[1] - p3[0]
-          b = p3[2] - p3[0]
-          n = a.cross(b)
-          n = (n.length == 0.0) ? Geom::Vector3d.new(0,0,1) : n.normalize
-
-          base = positions.length / 3
-          positions.concat(v3)
-          3.times { normals << n.x.to_f << n.y.to_f << n.z.to_f }
-
-          prims_by_mat[mat_idx][:indices].concat([base, base + 1, base + 2])
-        end
-      end
+	
+	faces.each do |face, tr_accum, inst_mat|
+	  next unless face && self.visible?(face)
+	  mesh = face.mesh 7
+	  next unless mesh
+	
+	  # Effective material (respect parent override + back side)
+	  front_mat = face.material || inst_mat
+	  back_mat  = face.back_material || inst_mat
+	  using_front = !!front_mat
+	  eff_mat = front_mat || back_mat  # may be nil => "_DEFAULT_"
+	
+	  mat_idx = get_mat_idx.call(eff_mat)
+	
+	  pts = mesh.points
+	  tri_count = mesh.count_polygons
+	
+	  # UV helper for the material actually used
+	  uvh = face.get_UVHelper(true, true, eff_mat)
+	
+	  (1..tri_count).each do |t|
+		idxs = mesh.polygon_at(t)
+		next unless idxs && idxs.length >= 3
+	
+		p3 = []
+		v3 = []
+		3.times do |k|
+		  i = idxs[k].abs
+		  p = pts[i - 1]
+		  next unless p
+	
+		  p_model = p.transform(tr_accum)
+		  p_gl    = p_model.transform(tr_world)
+	
+		  p3 << p_gl
+		  v3 << p_gl.x.to_f << p_gl.y.to_f << p_gl.z.to_f
+	
+		  # Correct UVs for the side in use
+		  uvq = using_front ? uvh.get_front_UVQ(p) : uvh.get_back_UVQ(p)
+		  u  = uvq.x / uvq.z
+		  vv = uvq.y / uvq.z
+		  uvs << u.to_f << vv.to_f
+		end
+		next unless p3.length == 3
+	
+		a = p3[1] - p3[0]; b = p3[2] - p3[0]
+		n = a.cross(b); n = (n.length == 0.0) ? Geom::Vector3d.new(0,0,1) : n.normalize
+	
+		base = positions.length / 3
+		positions.concat(v3)
+		3.times { normals << n.x.to_f << n.y.to_f << n.z.to_f }
+	
+		prims_by_mat[mat_idx][:indices].concat([base, base + 1, base + 2])
+	  end
+	end
 
       return nil if positions.empty?
 
@@ -224,43 +232,42 @@ def self.export(gltf_path, bin_path, ents)
       mesh_index
     end
 
-    # Faces directly contained in an entity (no recursion)
-    faces_immediate = lambda do |entities, tr_accum|
-      list = []
-      entities.each do |e|
-        next unless self.visible?(e)
-        list << [e, tr_accum] if e.is_a?(Sketchup::Face)
-      end
-      list
-    end
+	# Faces directly contained in an entity (NO recursion), but pass the parent override
+	faces_immediate = lambda do |entities, tr_accum, inst_mat|
+	  list = []
+	  entities.each do |e|
+	    next unless self.visible?(e)
+	    list << [e, tr_accum, inst_mat] if e.is_a?(Sketchup::Face)
+	  end
+	  list
+	end
 
     # Recursive walk → create node, attach mesh (from its own faces), then children
-    walk_entity = lambda do |carrier, tr_parent|
-      name = self.entity_label(carrier)
-      node = { name: name }
-      node_index = gltf[:nodes].length
-      gltf[:nodes] << node
+	walk_entity = lambda do |carrier, tr_parent|
+	  name = self.entity_label(carrier)
+	  node = { name: name }
+	  node_index = gltf[:nodes].length
+	  gltf[:nodes] << node
+	
+	  child_ents = carrier.is_a?(Sketchup::ComponentInstance) ? carrier.definition.entities : carrier.entities
+	  faces = faces_immediate.call(child_ents, tr_parent * carrier.transformation, carrier.material)
+	  if !faces.empty?
+	    mesh_index = emit_mesh_for.call(name, faces)   # faces includes inst_mat now
+	    node[:mesh] = mesh_index if mesh_index
+	  end
+	
+	  children = []
+	  child_ents.each do |e|
+	    next unless self.visible?(e)
+	    if e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
+	      ci = walk_entity.call(e, tr_parent * carrier.transformation)
+	      children << ci
+	    end
+	  end
+	  node[:children] = children unless children.empty?
+	  node_index
+	end
 
-      # Gather faces that live directly under this carrier
-      child_ents = carrier.is_a?(Sketchup::ComponentInstance) ? carrier.definition.entities : carrier.entities
-      faces = faces_immediate.call(child_ents, tr_parent * carrier.transformation)
-      if !faces.empty?
-        mesh_index = emit_mesh_for.call(name, faces)
-        node[:mesh] = mesh_index if mesh_index
-      end
-
-      # Recurse into groups/instances
-      children = []
-      child_ents.each do |e|
-        next unless self.visible?(e)
-        if e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
-          ci = walk_entity.call(e, tr_parent * carrier.transformation)
-          children << ci
-        end
-      end
-      node[:children] = children unless children.empty?
-      node_index
-    end
 
     # Root scene: a synthetic node for faces directly under selection/model root
     root_faces = []
@@ -270,8 +277,8 @@ def self.export(gltf_path, bin_path, ents)
       next unless self.visible?(e)
       case e
       when Sketchup::Face
-        root_faces << [e, Geom::Transformation.new]
-      when Sketchup::Group, Sketchup::ComponentInstance
+		root_faces << [e, Geom::Transformation.new, nil] if e.is_a?(Sketchup::Face)
+	  when Sketchup::Group, Sketchup::ComponentInstance
         root_children << walk_entity.call(e, Geom::Transformation.new)
       else
         if e.respond_to?(:entities)
