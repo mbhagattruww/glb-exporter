@@ -8,7 +8,16 @@ require 'stringio'
 
 module Truww
   module GLTF
-    PLUGIN_NAME = "Export glTF (.glb Minimal)".freeze
+PLUGIN_NAME = "Export glTF (.gltf + .bin Minimal)".freeze
+
+# ...
+path = UI.savepanel("Export glTF (Minimal .gltf + .bin)", Dir.pwd, "model.gltf")
+return unless path
+gltf_path = path
+base = File.basename(gltf_path, ".*")
+dir  = File.dirname(gltf_path)
+bin_filename = "#{base}.bin"
+bin_path     = File.join(dir, bin_filename)
 
     # ---- Helpers -------------------------------------------------------------
     def self.pack_f32(arr); arr.pack('e*'); end
@@ -65,10 +74,6 @@ module Truww
       model = Sketchup.active_model
       sel   = model.selection
       ents  = sel.empty? ? model.entities : sel
-
-      path = UI.savepanel("Export glTF (Minimal .glb)", Dir.pwd, "model.glb")
-      return unless path
-      glb_path = path
 
       triangles = []
       positions = []
@@ -302,3 +307,4 @@ UI.messagebox("Exported:\n#{gltf_path}\n#{bin_path}")
     @menu_installed = true
   end
 end
+
