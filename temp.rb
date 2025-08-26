@@ -154,6 +154,19 @@ module Truww
       pos_byte_length = bin.string.bytesize - pos_buffer_view_offset
 
 # ---- Build bufferViews / accessors in correct order -------------------
+# Create the root glTF object (must exist before you set bufferViews/accessors)
+gltf = {
+  asset: { version: "2.0", generator: "Truww Minimal SU→glTF" },
+  scenes: [{ nodes: [0] }],
+  scene: 0,
+  nodes: [{ mesh: 0, name: "Root" }],
+  buffers: [],        # will set after writing BIN
+  bufferViews: [],    # we will fill now
+  accessors: [],      # we will fill now
+  materials: [],
+  meshes: []
+}
+      
 gltf[:bufferViews] = []
 gltf[:accessors]   = []
 gltf[:meshes]      = []
