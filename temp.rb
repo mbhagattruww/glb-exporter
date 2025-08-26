@@ -25,28 +25,10 @@ PLUGIN_NAME = "Export glTF (.gltf + .bin Minimal)".freeze
       ])
     end
 
-    # Fixed: Use model.options to scale according to SketchUp units
-    def self.model_units_to_meters
-      model = Sketchup.active_model
-      unit_code = model.options["UnitsOptions"]["LengthUnit"]
-
-      scale = case unit_code
-        when 0 # Inches
-          0.0254
-        when 1 # Feet
-          0.3048
-        when 2 # Millimeters
-          0.001
-        when 3 # Centimeters
-          0.01
-        when 4 # Meters
-          1.0
-        else
-          0.0254 # default to inches
-      end
-
-      Geom::Transformation.scaling(scale)
-    end
+# Replace the whole method with a fixed inches→meters scale
+def self.model_units_to_meters
+  Geom::Transformation.scaling(0.0254)  # inches → meters
+end
 
     def self.world_to_gltf
       self.model_units_to_meters * self.rotation_minus_90deg_x
