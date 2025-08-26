@@ -97,6 +97,8 @@ end
 tr_world = self.world_to_gltf
 model.start_operation("Export glTF (Minimal .gltf + .bin)", true)
 
+uvs = []
+
 each_visible_face_with_tr(ents) do |face, tr_inst|
   mesh = face.mesh(0)
   next unless mesh
@@ -112,22 +114,27 @@ each_visible_face_with_tr(ents) do |face, tr_inst|
 
     v  = []
     p3 = []
+    uvtri = []
     3.times do |k|
       i = idxs[k].abs
       p = pts[i - 1]
       next unless p
 
-      # 1) local(definition) -> model: apply instance/group transform chain
-      p_model = Geom::Point3d.new(p.x, p.y, p.z).transform(tr_inst)
-      # 2) model -> glTF: scale inches->meters and -90° X
+      # Transform to world → glTF
+      p_model = p.transform(tr_inst)
       p_gl    = p_model.transform(tr_world)
 
+      # Position
       p3 << p_gl
       v  << p_gl.x.to_f << p_gl.y.to_f << p_gl.z.to_f
+
+      # UV from face
+      uvq = face.uv_at(p, true)  # true = front side
+      uvtri << [uvq.x.to_f, uvq.y.to_f]
     end
     next unless p3.length == 3
 
-    # Flat triangle normal in glTF space
+    # Normal
     a = p3[1] - p3[0]
     b = p3[2] - p3[0]
     n = a.cross(b)
@@ -136,6 +143,7 @@ each_visible_face_with_tr(ents) do |face, tr_inst|
     base = positions.length / 3
     positions.concat(v)
     3.times { normals << n.x.to_f << n.y.to_f << n.z.to_f }
+    uvtri.each { |u,vv| uvs << u << vv }  # push 2D UVs
     prim[:indices].concat([base, base+1, base+2])
   end
 end
@@ -196,6 +204,28 @@ nrm_offset = bin.string.bytesize
 bin.write(pack_f32(normals))
 nrm_length = bin.string.bytesize - nrm_offset
 
+# TEXCOORD_0
+align4.call(bin)
+uv_off = bin.string.bytesize
+bin.write(pack_f32(uvs))
+uv_len = bin.string.bytesize - uv_off
+
+gltf[:bufferViews] << {
+  buffer: 0,
+  byteOffset: uv_off,
+  byteLength: uv_len,
+  target: 34962
+}
+gltf[:accessors] << {
+  bufferView: gltf[:bufferViews].length - 1,
+  componentType: 5126, # FLOAT
+  count: uvs.length / 2,
+  type: "VEC2"
+}
+acc_uv = gltf[:accessors].length - 1
+
+
+
 gltf[:bufferViews] << {
   buffer: 0,
   byteOffset: nrm_offset,
@@ -210,19 +240,62 @@ gltf[:accessors] << {
 }
 acc_nrm = gltf[:accessors].length - 1
 
-# Materials (unchanged)
-mat_keys_sorted = material_map.keys.sort_by { |k| material_map[k] }
+images   = []
+textures = []
+
 mat_keys_sorted.each do |key|
   su_mat = key == "_DEFAULT_" ? nil : Sketchup.active_model.materials[key]
-  pbr = {
-    pbrMetallicRoughness: {
-      baseColorFactor: self.color_to_basecolorfactor(su_mat),
-      metallicFactor: 0.0, roughnessFactor: 0.5
-    },
-    name: (su_mat ? su_mat.display_name : "Default")
-  }
-  gltf[:materials] << pbr
+
+  if su_mat && su_mat.texture
+    tex = su_mat.texture
+    tmp_path = File.join(Dir.tmpdir, "tex.png")
+    tex.write(tmp_path)
+    img_data = File.binread(tmp_path)
+
+    # Align to 4 bytes
+    align4.call(bin)
+    img_off = bin.string.bytesize
+    bin.write(img_data)
+    img_len = bin.string.bytesize - img_off
+
+    bv_idx = gltf[:bufferViews].length
+    gltf[:bufferViews] << {
+      buffer: 0,
+      byteOffset: img_off,
+      byteLength: img_len
+    }
+
+    img_index = images.length
+    images << {
+      bufferView: bv_idx,
+      mimeType: "image/png"
+    }
+    textures << { source: img_index }
+
+    pbr = {
+      pbrMetallicRoughness: {
+        baseColorTexture: { index: textures.length - 1 },
+        metallicFactor: 0.0, roughnessFactor: 0.5
+      },
+      name: su_mat.display_name
+    }
+    gltf[:materials] << pbr
+
+  else
+    # Fallback flat color
+    pbr = {
+      pbrMetallicRoughness: {
+        baseColorFactor: self.color_to_basecolorfactor(su_mat),
+        metallicFactor: 0.0, roughnessFactor: 0.5
+      },
+      name: (su_mat ? su_mat.display_name : "Default")
+    }
+    gltf[:materials] << pbr
+  end
 end
+
+gltf[:images]   = images   unless images.empty?
+gltf[:textures] = textures unless textures.empty?
 
 # Indices per primitive — write and wire
 prim_entries = []
@@ -247,7 +320,7 @@ prims.each do |p|
   acc_idx = gltf[:accessors].length - 1
 
   prim_entries << {
-    attributes: { "POSITION" => acc_pos, "NORMAL" => acc_nrm },
+    attributes: { "POSITION" => acc_pos, "NORMAL" => acc_nrm, "TEXCOORD_0" => acc_uv },
     indices: acc_idx,
     material: p[:mat_idx],
     mode: 4 # TRIANGLES
