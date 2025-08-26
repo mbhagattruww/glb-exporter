@@ -148,10 +148,6 @@ module Truww
       }
       pos_min,pos_max = minmax.call(positions)
 
-      align4.call(bin)
-      pos_buffer_view_offset = bin.string.bytesize
-      bin.write(pack_f32(positions))
-      pos_byte_length = bin.string.bytesize - pos_buffer_view_offset
 
 # ---- Build bufferViews / accessors in correct order -------------------
 # Create the root glTF object (must exist before you set bufferViews/accessors)
@@ -264,59 +260,37 @@ gltf[:buffers] = [{ byteLength: bin.string.bytesize }]
 
 
   
-      # ---- Write GLB ---------------------------------------------------------
-json_str = JSON.generate(gltf)
+# ---- Finalize external BIN + write .bin/.gltf -------------------------
 
-# 4-byte alignment for JSON
-json_pad = (4 - (json_str.bytesize % 4)) % 4
-json_str += " " * json_pad
-
-# Binary buffer + 4-byte alignment
+# 4-byte align the BIN so all bufferView byteOffsets remain valid
 bin_data = bin.string
 bin_pad  = (4 - (bin_data.bytesize % 4)) % 4
-bin_data += "\x00" * bin_pad
+bin_data += "\x00" * bin_pad if bin_pad > 0
 
-# IMPORTANT: Set buffers AFTER padding, using the actual BIN chunk size
-gltf[:buffers] = [{ byteLength: bin_data.bytesize }]
+# Point buffers[0] to external .bin (must be an array with 1 entry)
+gltf[:buffers] = [{
+  byteLength: bin_data.bytesize,
+  uri: bin_filename
+}]
 
-# Re-generate JSON now that buffers has final byteLength
-json_str = JSON.generate(gltf)
-json_pad = (4 - (json_str.bytesize % 4)) % 4
-json_str += " " * json_pad
-
-File.open(glb_path, "wb") do |f|
-  f.write("glTF".b)                 # magic
-  f.write([2].pack("L<"))           # version
-  total_len = 12 + 8 + json_str.bytesize + 8 + bin_data.bytesize
-  f.write([total_len].pack("L<"))
-
-  # JSON chunk
-  f.write([json_str.bytesize].pack("L<"))
-  f.write(["JSON".b].pack("A4"))
-  f.write(json_str)
-
-  # BIN chunk
-  f.write([bin_data.bytesize].pack("L<"))
-  f.write(["BIN".b].pack("A4"))     # writes "BIN\0"
-  f.write(bin_data)
-end
-
-used = 0
+# Optional quick sanity check: ensure no bufferView exceeds BIN size
+max_used = 0
 gltf[:bufferViews].each_with_index do |bv, i|
-  raise "bufferView[#{i}] not buffer 0" unless bv[:buffer] == 0
-  end_off = bv[:byteOffset] + bv[:byteLength]
-  used = [used, end_off].max
+  raise "bufferView[#{i}] must reference buffer 0" unless bv[:buffer] == 0
+  end_off = (bv[:byteOffset] || 0) + (bv[:byteLength] || 0)
+  max_used = [max_used, end_off].max
 end
+raise "BIN smaller than used bufferViews" if bin_data.bytesize < max_used
 
-raise "accessors empty" if gltf[:accessors].empty?
-raise "meshes empty"    if gltf[:meshes].empty?
+# Write the .bin
+File.binwrite(bin_path, bin_data)
 
-# After padding BIN
-raise "BIN smaller than used views (#{bin_data.bytesize} < #{used})" if bin_data.bytesize < used
+# Write the .gltf (pretty or compact; pretty helps debugging)
+json_str = JSON.pretty_generate(gltf)
+File.write(gltf_path, json_str)
 
-
-      model.commit_operation
-      UI.messagebox("Exported:\n#{glb_path}")
+model.commit_operation
+UI.messagebox("Exported:\n#{gltf_path}\n#{bin_path}")
     rescue => e
       model.abort_operation
       UI.messagebox("Export failed: #{e.class}: #{e.message}\n#{e.backtrace&.first}")
