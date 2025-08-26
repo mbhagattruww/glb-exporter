@@ -11,13 +11,6 @@ module Truww
 PLUGIN_NAME = "Export glTF (.gltf + .bin Minimal)".freeze
 
 # ...
-path = UI.savepanel("Export glTF (Minimal .gltf + .bin)", Dir.pwd, "model.gltf")
-return unless path
-gltf_path = path
-base = File.basename(gltf_path, ".*")
-dir  = File.dirname(gltf_path)
-bin_filename = "#{base}.bin"
-bin_path     = File.join(dir, bin_filename)
 
     # ---- Helpers -------------------------------------------------------------
     def self.pack_f32(arr); arr.pack('e*'); end
@@ -71,6 +64,13 @@ bin_path     = File.join(dir, bin_filename)
 
     # ---- Core Export ---------------------------------------------------------
     def self.export
+      path = UI.savepanel("Export glTF (Minimal .gltf + .bin)", Dir.pwd, "model.gltf")
+      return unless path
+      gltf_path = path
+      base = File.basename(gltf_path, ".*")
+      dir  = File.dirname(gltf_path)
+      bin_filename = "#{base}.bin"
+      bin_path     = File.join(dir, bin_filename)
       model = Sketchup.active_model
       sel   = model.selection
       ents  = sel.empty? ? model.entities : sel
