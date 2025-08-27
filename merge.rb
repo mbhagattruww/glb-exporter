@@ -93,14 +93,16 @@ def self.export(gltf_path, bin_path, ents)
     }
     images   = []
     textures = []
-    material_map = {} # key (name or _DEFAULT_) -> material index
 
-    # One TextureWriter for all UV helpers (IMPORTANT)
+    # ✅ Key materials by the Material object (or :__DEFAULT__), not by display name
+    material_map = {} # { (Sketchup::Material or :__DEFAULT__) => material_index }
+
+    # One TextureWriter for all UV helpers (OPTIONAL; safe to keep)
     tw = Sketchup::TextureWriter.new
 
     # Build (or fetch) material index
     get_mat_idx = lambda do |su_mat|
-      key = su_mat ? su_mat.display_name : "_DEFAULT_"
+      key = su_mat || :__DEFAULT__
       material_map[key] = material_map.length unless material_map.key?(key)
       material_map[key]
     end
@@ -121,14 +123,14 @@ def self.export(gltf_path, bin_path, ents)
         front_mat   = face.material || inst_mat
         back_mat    = face.back_material || inst_mat
         using_front = !!front_mat
-        eff_mat     = front_mat || back_mat # may be nil => "_DEFAULT_"
+        eff_mat     = front_mat || back_mat # may be nil => :__DEFAULT__
 
         mat_idx = get_mat_idx.call(eff_mat)
 
         pts = mesh.points
         tri_count = mesh.count_polygons
 
-        # UV helper uses a TextureWriter, NOT a material
+        # UV helper – use TextureWriter version (or omit 3rd arg if you prefer)
         uvh = face.get_UVHelper(true, true, tw)
 
         (1..tri_count).each do |t|
@@ -253,7 +255,7 @@ def self.export(gltf_path, bin_path, ents)
       child_ents = carrier.is_a?(Sketchup::ComponentInstance) ? carrier.definition.entities : carrier.entities
       faces = faces_immediate.call(child_ents, tr_parent * carrier.transformation, carrier.material)
       if !faces.empty?
-        mesh_index = emit_mesh_for.call(name, faces)   # faces includes inst_mat now
+        mesh_index = emit_mesh_for.call(name, faces)
         node[:mesh] = mesh_index if mesh_index
       end
 
@@ -283,9 +285,7 @@ def self.export(gltf_path, bin_path, ents)
         root_children << walk_entity.call(e, Geom::Transformation.new)
       else
         if e.respond_to?(:entities)
-          # faces directly under carrier at root (pass nil override!)
           root_faces.concat(faces_immediate.call(e.entities, Geom::Transformation.new, nil))
-          # and descend one level for proper groups/instances
           e.entities.each do |c|
             if (c.is_a?(Sketchup::Group) || c.is_a?(Sketchup::ComponentInstance)) && self.visible?(c)
               root_children << walk_entity.call(c, Geom::Transformation.new)
@@ -295,7 +295,6 @@ def self.export(gltf_path, bin_path, ents)
       end
     end
 
-    # If there are root faces, create a node for them
     if !root_faces.empty?
       name = "UntaggedGeometry"
       mesh_index = emit_mesh_for.call(name, root_faces)
@@ -304,15 +303,19 @@ def self.export(gltf_path, bin_path, ents)
       gltf[:scenes][0][:nodes] << (gltf[:nodes].length - 1)
     end
 
-    # Add top-level children to scene
     gltf[:scenes][0][:nodes].concat(root_children) unless root_children.empty?
 
     # ---------- materials (shared; embed textures in BIN) ----------
-    mat_keys_sorted = material_map.keys.sort_by { |k| material_map[k] }
-    mat_keys_sorted.each do |key|
-      su_mat = key == "_DEFAULT_" ? nil : Sketchup.active_model.materials[key]
+    # Build materials array in *exact* indices as in material_map
+    gltf[:materials] = Array.new(material_map.length)
+
+    material_map.each do |key, idx|
+      su_mat = (key == :__DEFAULT__) ? nil : key # key is Material or :__DEFAULT__
+
       if su_mat && su_mat.texture
         tex = su_mat.texture
+
+        # Write the image bytes into BIN (PNG/JPG) – TextureWriter baking optional
         tmp_path = File.join(Dir.tmpdir, "tex.png")
         tex.write(tmp_path)
         img_data = File.binread(tmp_path)
@@ -329,16 +332,16 @@ def self.export(gltf_path, bin_path, ents)
         images   << { bufferView: bv_tex, mimeType: "image/png" }
         textures << { source: img_index }
 
-        gltf[:materials] << {
-          name: su_mat.display_name,
+        gltf[:materials][idx] = {
+          name: (su_mat.display_name rescue su_mat.name),
           pbrMetallicRoughness: {
             baseColorTexture: { index: textures.length - 1 },
             metallicFactor: 0.0, roughnessFactor: 0.5
           }
         }
       else
-        gltf[:materials] << {
-          name: (su_mat ? su_mat.display_name : "Default"),
+        gltf[:materials][idx] = {
+          name: su_mat ? ((su_mat.display_name rescue su_mat.name) || "Material") : "Default",
           pbrMetallicRoughness: {
             baseColorFactor: self.color_to_basecolorfactor(su_mat),
             metallicFactor: 0.0, roughnessFactor: 0.5
@@ -346,6 +349,7 @@ def self.export(gltf_path, bin_path, ents)
         }
       end
     end
+
     gltf[:images]   = images unless images.empty?
     gltf[:textures] = textures unless textures.empty?
 
